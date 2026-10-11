@@ -37,6 +37,11 @@ build/quantize breeze-tts2-BF16.gguf breeze-tts2-Q5_K_M.gguf Q5_K_M
 The codec is the stock `qwen-tokenizer-12hz-*.gguf` that qwentts.cpp already
 uses.
 
+Converted files are published at
+[mecha-factory/mecha-speech-gguf](https://huggingface.co/mecha-factory/mecha-speech-gguf):
+Q5_K_M and Q6_K, the codec, and a default voice. They're under the same
+non-commercial licence, with a NOTICE and every file's sha256.
+
 ## Serving
 
 ```
