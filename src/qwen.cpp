@@ -285,6 +285,32 @@ static qt_status qt_extract_voice_ref_run(qt_context * q, RefJob * job) {
     try {
         // Lazy residency: the first reference audio request pays the
         // weight load once, mirroring the qt_synthesize ref_audio path.
+        // Breeze has no x-vector: the reference is its codes plus the
+        // transcript. A one value placeholder keeps the latent ABI shape.
+        if (q->pt.is_breeze) {
+            const int            aligned_n = (job->n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
+            std::vector<int32_t> codes     = pipeline_codec_encode(&q->pt.codec, job->audio, aligned_n);
+            if (codes.empty()) {
+                qt_set_error("qt_extract_voice_ref: pipeline_codec_encode returned empty codes");
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            const int K          = q->pt.num_code_groups;
+            float *   emb_copy   = (float *) std::calloc(1, sizeof(float));
+            int32_t * codes_copy = (int32_t *) std::malloc(codes.size() * sizeof(int32_t));
+            if (!emb_copy || !codes_copy) {
+                std::free(emb_copy);
+                std::free(codes_copy);
+                return QT_STATUS_OOM;
+            }
+            std::memcpy(codes_copy, codes.data(), codes.size() * sizeof(int32_t));
+            job->out->ref_spk_emb   = emb_copy;
+            job->out->ref_spk_dim   = 1;
+            job->out->ref_codes     = codes_copy;
+            job->out->ref_T         = (int) (codes.size() / (size_t) K);
+            job->out->num_codebooks = K;
+            qt_log(QT_LOG_INFO, "[Qwen] Extracted Breeze voice ref: K=%d T=%d", K, job->out->ref_T);
+            return QT_STATUS_OK;
+        }
         if (!q->pt.spk_enc_loaded) {
             Timer t_spk_load;
             if (!speaker_encoder_weights_load(&q->pt.speaker_encoder, q->pt.gguf_talker, q->pt.backend) ||
@@ -472,14 +498,17 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
         // base vocab + the qwen3-tts text specials in one shot. The
         // specials key list matches the keys written by the conversion
         // script under the qwen3-tts.text.* namespace.
-        if (!load_bpe_from_gguf(&q->tok, params->talker_path)) {
-            qt_throw("qt_init: load_bpe_from_gguf failed for '%s'", params->talker_path);
+        // Breeze carries its own Gemma tokenizer (loaded by the pipeline).
+        if (!q->pt.is_breeze) {
+            if (!load_bpe_from_gguf(&q->tok, params->talker_path)) {
+                qt_throw("qt_init: load_bpe_from_gguf failed for '%s'", params->talker_path);
+            }
+            const char * specials_keys[] = {
+                "qwen3-tts.text.im_start_id", "qwen3-tts.text.im_end_id",  "qwen3-tts.text.tts_pad_id",
+                "qwen3-tts.text.tts_bos_id",  "qwen3-tts.text.tts_eos_id",
+            };
+            bpe_load_specials_from_keys(&q->tok, params->talker_path, specials_keys, 5);
         }
-        const char * specials_keys[] = {
-            "qwen3-tts.text.im_start_id", "qwen3-tts.text.im_end_id",  "qwen3-tts.text.tts_pad_id",
-            "qwen3-tts.text.tts_bos_id",  "qwen3-tts.text.tts_eos_id",
-        };
-        bpe_load_specials_from_keys(&q->tok, params->talker_path, specials_keys, 5);
     } catch (const std::exception & e) {
         qt_set_error("%s", e.what());
         qt_log(QT_LOG_ERROR, "[Qwen] %s", e.what());
@@ -547,11 +576,11 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
     }
 
     const std::string & mt = q->pt.model_type;
-    if (mt != "base") {
+    if (mt != "base" && mt != "breeze") {
         qt_set_error("qt_extract_voice_ref: voice references are only valid for base models (loaded: %s)", mt.c_str());
         return QT_STATUS_MODE_INVALID;
     }
-    if (!q->pt.has_speaker_encoder) {
+    if (mt == "base" && !q->pt.has_speaker_encoder) {
         qt_set_error("qt_extract_voice_ref: loaded base model has no speaker encoder");
         return QT_STATUS_GENERATE_FAILED;
     }
@@ -593,8 +622,8 @@ static bool qt_language_known(const struct qt_context * q, const char * lang) {
     for (char & c : name) {
         c = (char) std::tolower((unsigned char) c);
     }
-    if (name == "auto") {
-        return true;
+    if (name == "auto" || q->pt.languages.empty()) {
+        return true;  // Breeze has no language table: the text says it
     }
     for (const LanguageEntry & e : q->pt.languages) {
         if (e.name == name) {
@@ -681,7 +710,7 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
     const bool has_lat_spk   = params->ref_spk_emb && params->ref_spk_dim > 0;
     const bool has_lat_codes = params->ref_codes && params->ref_T > 0;
 
-    if ((params->ref_audio_24k || has_lat_spk) && mt != "base") {
+    if ((params->ref_audio_24k || has_lat_spk) && mt != "base" && mt != "breeze") {
         qt_set_error("--ref-wav / --ref-spk is only valid for base models (loaded: %s)", mt.c_str());
         if (out) {
             qt_audio_free(out);

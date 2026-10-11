@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #ifdef _WIN32
@@ -121,6 +122,55 @@ static bool is_embed(const char * name) {
 // even BF16 destroys the mantissa enough to mis-select codes and break
 // voice cloning. Same philosophy as acestep.cpp keeping VAE-critical
 // paths in full precision.
+// Per tensor overrides, the optional 4th CLI argument: a comma separated
+// list of "substring=TYPE" rules, first match wins, TYPE is a ggml type
+// name (q8_0, q4_K, q5_K, q6_K, bf16, f16, ...) or "keep" for the source
+// type. Used for the Breeze mixed variants (backbone and depth decoder at
+// different precisions).
+struct OverrideRule {
+    std::string    pat;
+    enum ggml_type type;  // GGML_TYPE_COUNT = keep the source type
+};
+static std::vector<OverrideRule> g_overrides;
+
+static bool parse_overrides(const char * spec) {
+    std::string s = spec;
+    size_t      p = 0;
+    while (p < s.size()) {
+        size_t      e    = s.find(',', p);
+        std::string rule = s.substr(p, e == std::string::npos ? std::string::npos : e - p);
+        p                = e == std::string::npos ? s.size() : e + 1;
+        if (rule.empty()) {
+            continue;
+        }
+        size_t eq = rule.find('=');
+        if (eq == std::string::npos) {
+            fprintf(stderr, "[Quantize] bad override rule '%s'\n", rule.c_str());
+            return false;
+        }
+        std::string    pat = rule.substr(0, eq), tn = rule.substr(eq + 1);
+        enum ggml_type t   = GGML_TYPE_COUNT;
+        if (strcasecmp(tn.c_str(), "keep") != 0) {
+            bool found = false;
+            for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+                const char * nm = ggml_type_name((enum ggml_type) i);
+                if (nm && strcasecmp(nm, tn.c_str()) == 0) {
+                    t     = (enum ggml_type) i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                fprintf(stderr, "[Quantize] unknown type '%s' in override\n", tn.c_str());
+                return false;
+            }
+        }
+        g_overrides.push_back({ pat, t });
+        fprintf(stderr, "[Quantize] override: *%s* -> %s\n", pat.c_str(), t == GGML_TYPE_COUNT ? "keep" : ggml_type_name(t));
+    }
+    return true;
+}
+
 static bool should_quantize(const char * name, int n_dims, const char * arch) {
     if (strstr(arch, "vae")) {
         return false;
@@ -164,6 +214,12 @@ static bool should_quantize(const char * name, int n_dims, const char * arch) {
     if (strstr(name, "spk_enc.fc.weight")) {
         return false;
     }
+    // Breeze: the text encoder token table is gathered on the host once
+    // per request; keep it at its source precision. llama3 rope factors
+    // are 1D and already skipped above.
+    if (strstr(name, "text_enc.token_embd")) {
+        return false;
+    }
     return true;
 }
 
@@ -175,6 +231,11 @@ static enum ggml_type pick_type(const char *         name,
                                 int                  n_layers) {
     if (!should_quantize(name, n_dims, arch)) {
         return GGML_TYPE_COUNT;
+    }
+    for (const OverrideRule & r : g_overrides) {
+        if (strstr(name, r.pat.c_str())) {
+            return r.type;
+        }
     }
 
     // embed_tokens in LM: use embed type
@@ -229,6 +290,12 @@ static bool to_f32(const void * src, float * dst, int64_t n, enum ggml_type type
 
 int main(int argc, char ** argv) {
     utf8_init(&argc, &argv);
+    if (argc == 5) {
+        if (!parse_overrides(argv[4])) {
+            return 1;
+        }
+        argc = 4;
+    }
     if (argc != 4) {
         fprintf(stderr, "qwentts.cpp %s\n\n", QWEN_VERSION);
         fprintf(stderr, "Usage: %s <input.gguf> <output.gguf> <type>\n", argv[0]);
@@ -382,7 +449,10 @@ int main(int argc, char ** argv) {
         // Q* effective on these weights, and gf_load_conv on the C++ side
         // loads every conv kernel as F16 regardless of source dtype.
         if (can_convert && !aligned) {
-            target  = GGML_TYPE_F16;
+            // Rows not divisible by the K-quant block (Breeze text encoder,
+            // hidden 1152): Q8_0 when 32 divides them, else F16.
+            target  = (t->ne[0] % ggml_blck_size(GGML_TYPE_Q8_0) == 0 && target != GGML_TYPE_BF16 &&
+                      target != GGML_TYPE_F16) ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
             aligned = true;
         }
 

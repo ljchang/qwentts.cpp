@@ -190,6 +190,12 @@ add_executable(tts-server tools/tts-server.cpp)
 target_link_libraries(tts-server PRIVATE qwen-core httplib yyjson)
 link_ggml_backends(tts-server)
 
+# gemma-tok : Breeze TTS 2's Gemma tokenizer, read from a converted GGUF —
+# text in, token ids out, for checking against the reference (BREEZE.md).
+add_executable(gemma-tok tools/gemma-tok.cpp)
+target_link_libraries(gemma-tok PRIVATE qwen-core)
+link_ggml_backends(gemma-tok)
+
 # test-abi-c : pure C99 smoke test that locks in the public ABI contract.
 # Compiles qwen.h with a C compiler under -Wall -Werror -pedantic and
 # links against the static lib. The test never loads a model ; failure

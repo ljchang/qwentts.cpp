@@ -213,3 +213,9 @@ MIT. See [LICENSE](LICENSE).
 
 Upstream model : Qwen3-TTS by Alibaba / Qwen team, Apache 2.0.
 Audio codec : Qwen3-TTS-Tokenizer-12Hz (Qwen team), Apache 2.0.
+
+## Breeze TTS 2
+
+This fork adds Breeze TTS 2 (BreezeBlue) on the same engine. See
+[BREEZE.md](BREEZE.md). Its weights are licensed for research and
+non-commercial use only.

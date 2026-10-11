@@ -139,7 +139,7 @@ int main(int argc, char ** argv) {
     // reference, so both payloads are refused on any other model type.
     be.register_voice = [q](const tts_voice_upload & up, std::string & err) -> bool {
         const std::string mt = qt_model_type(q);
-        if (mt != "base") {
+        if (mt != "base" && mt != "breeze") {
             err = "voice registration is only valid for base models (loaded: " + mt + ")";
             return false;
         }

@@ -23,6 +23,8 @@
 #include "speaker-encoder-weights.h"
 #include "talker-decode-graph.h"
 #include "talker-weights.h"
+#include "gemma-tokenizer.h"
+#include "text-encoder.h"
 
 #include <cstdint>
 #include <string>
@@ -180,6 +182,22 @@ struct PipelineTTS {
     GraphArena                     talker_arena;
     std::vector<TalkerDecodeGraph> talker_decode_graphs;  // one per 256 step window class, lazy
     std::vector<CodePredGraphSet>  cp_graphs;             // index N - 1, lazy per batch width
+
+    // Breeze TTS 2 (model_type "breeze"): the backbone and depth decoder
+    // ride the talker / code predictor paths above; the prompt comes from
+    // the T5Gemma2 text encoder and the Gemma tokenizer instead of the
+    // Qwen text embedding, the backbone head suppresses [c0_lo, c0_hi)
+    // with EOS at codec_specials.eos_id, there is no text overlay and no
+    // codec priming with the reference.
+    bool               is_breeze = false;
+    TextEncoderWeights text_enc;
+    GemmaTokenizer     gtok;
+    int                breeze_c0_lo          = 0;
+    int                breeze_c0_hi          = 0;
+    int32_t            breeze_cb_eos         = 0;
+    int32_t            breeze_audio_token_id = 0;
+    int32_t            breeze_audio_eos_id   = 0;
+    std::vector<std::pair<std::string, std::vector<float>>> breeze_seg_cache;
 };
 
 // Open the talker GGUF and the codec GGUF, load every module on the

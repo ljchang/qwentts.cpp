@@ -91,14 +91,16 @@ static int sample_top_k_p(float *         logits,
                           int64_t         seed,
                           int64_t         philox_subseq,
                           float *         dump_u_out) {
+    // Repetition penalty first on both paths: HF generate() (and the
+    // Breeze runtime's sample_logits) apply it before the argmax too.
+    apply_repetition_penalty(logits, V, history, n_history, rep_pen);
+
     if (temperature <= 0.0f) {
         if (dump_u_out) {
             *dump_u_out = -1.0f;
         }
         return (int) (std::max_element(logits, logits + V) - logits);
     }
-
-    apply_repetition_penalty(logits, V, history, n_history, rep_pen);
 
     float inv_temp = 1.0f / temperature;
     for (int i = 0; i < V; i++) {

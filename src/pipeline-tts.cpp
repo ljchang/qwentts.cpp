@@ -12,6 +12,7 @@
 #include "ggml.h"
 #include "pipeline-codec.h"
 #include "prompt-builder.h"
+#include "breeze-prompt.h"
 #include "qt-error.h"
 #include "sampling-defaults.h"
 #include "sampling.h"
@@ -186,6 +187,7 @@ bool pipeline_tts_load(PipelineTTS * pt,
     parse_text_specials(pt->gguf_talker, pt->text_specials);
     parse_languages(pt->gguf_talker, pt->languages);
     parse_speakers(pt->gguf_talker, pt->speakers);
+    pt->is_breeze = (pt->model_type == "breeze");
 
     if (!talker_weights_load(&pt->talker, pt->gguf_talker, pt->backend)) {
         gf_close(&pt->gguf_talker);
@@ -196,6 +198,31 @@ bool pipeline_tts_load(PipelineTTS * pt,
         talker_weights_free(&pt->talker);
         gf_close(&pt->gguf_talker);
         return false;
+    }
+
+    if (pt->is_breeze) {
+        pt->breeze_c0_lo          = (int) gf_get_u32(pt->gguf_talker, "breeze.c0_suppress_lo");
+        pt->breeze_c0_hi          = (int) gf_get_u32(pt->gguf_talker, "breeze.c0_suppress_hi");
+        pt->breeze_cb_eos         = (int32_t) gf_get_u32(pt->gguf_talker, "breeze.codebook_eos_token_id");
+        pt->breeze_audio_token_id = (int32_t) gf_get_u32(pt->gguf_talker, "breeze.audio_token_id");
+        pt->breeze_audio_eos_id   = (int32_t) gf_get_u32(pt->gguf_talker, "breeze.audio_eos_token_id");
+        bool ok                   = false;
+        try {
+            ok = text_encoder_weights_load(&pt->text_enc, pt->gguf_talker, pt->backend) &&
+                 gemma_tokenizer_load(&pt->gtok, talker_gguf_path);
+        } catch (const std::exception & ex) {
+            qt_log(QT_LOG_ERROR, "[Pipeline] Breeze load: %s", ex.what());
+            ok = false;
+        }
+        if (!ok) {
+            text_encoder_weights_free(&pt->text_enc);
+            code_predictor_weights_free(&pt->code_predictor);
+            talker_weights_free(&pt->talker);
+            gf_close(&pt->gguf_talker);
+            return false;
+        }
+        qt_log(QT_LOG_INFO, "[Pipeline] Breeze: c0 suppress [%d, %d), eos %d, audio ids %d / %d", pt->breeze_c0_lo,
+               pt->breeze_c0_hi, pt->codec_specials.eos_id, pt->breeze_audio_token_id, pt->breeze_audio_eos_id);
     }
 
     // Speaker encoder tensors are only present in Base checkpoints. The
@@ -239,7 +266,7 @@ bool pipeline_tts_load(PipelineTTS * pt,
 
     // Prompt cache: special embeds projected once on the backend, prefix
     // cache primed empty. Requires the sched, so it runs after sched_new.
-    if (!prompt_cache_load(pt)) {
+    if (!pt->is_breeze && !prompt_cache_load(pt)) {
         ggml_backend_sched_free(pt->sched);
         pt->sched = NULL;
         pipeline_codec_free(&pt->codec);
@@ -382,6 +409,8 @@ void pipeline_tts_free(PipelineTTS * pt) {
         speaker_encoder_weights_free(&pt->speaker_encoder);
         pt->spk_enc_loaded = false;
     }
+    text_encoder_weights_free(&pt->text_enc);
+    pt->breeze_seg_cache.clear();
     code_predictor_weights_free(&pt->code_predictor);
     talker_weights_free(&pt->talker);
     gf_close(&pt->gguf_talker);
@@ -718,6 +747,8 @@ static bool tts_admit_fail(TtsJob * job, qt_status st) {
     return false;
 }
 
+static bool tts_engine_admit_breeze(TtsEngine * e, TtsJob * job);
+
 bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     PipelineTTS *                pt     = e->pt;
     const struct qt_tts_params * params = job->params;
@@ -727,6 +758,9 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     if ((int) e->slots.size() >= pt->max_batch) {
         qt_set_error("tts_engine_admit: no free slot (%d active, max_batch %d)", (int) e->slots.size(), pt->max_batch);
         return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+    }
+    if (pt->is_breeze) {
+        return tts_engine_admit_breeze(e, job);
     }
 
     const std::string instruct = params->instruct ? params->instruct : "";
@@ -942,6 +976,117 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
     return true;
 }
 
+// Breeze admit: reference codes (pre-encoded latents or the raw 24 kHz
+// clip through the codec encoder), the single stream Breeze prompt, then
+// the same streaming lane attach and talker prefill as the Qwen path.
+// No speaker encoder, no ICL codec priming: Breeze decodes the generated
+// frames from a zero codec state.
+static bool tts_engine_admit_breeze(TtsEngine * e, TtsJob * job) {
+    PipelineTTS *                pt     = e->pt;
+    const struct qt_tts_params * params = job->params;
+
+    const std::string instruct = params->instruct ? params->instruct : "";
+    const std::string ref_text = params->ref_text ? params->ref_text : "";
+    const bool has_ref_audio   = (params->ref_audio_24k != NULL) && (params->ref_n_samples > 0);
+    const bool has_lat_codes   = (params->ref_codes != NULL) && (params->ref_T > 0);
+    if ((has_ref_audio || has_lat_codes) && ref_text.empty()) {
+        qt_set_error("tts_engine_admit: Breeze voice cloning needs the reference transcript (ref_text)");
+        return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+    }
+
+    e->slots.emplace_back();
+    TtsSlot & s        = e->slots.back();
+    const int slot_idx = (int) e->slots.size() - 1;
+    s.job              = job;
+    s.serial           = e->next_serial++;
+    s.ref_codes_ptr    = NULL;
+    s.ref_codes_T      = 0;
+    s.step             = 0;
+    s.subseq_counter   = 0;
+    s.prev_overlay     = NULL;
+    s.pending_c0       = -1;
+    s.has_frame        = false;
+    s.streaming        = (params->on_chunk != NULL);
+    s.codec_set        = -1;
+    s.finished         = false;
+    s.fin_status       = QT_STATUS_OK;
+    s.perf             = {};
+    s.t_total.reset();
+
+    const int32_t * codes   = NULL;
+    int             codes_T = 0;
+    if (has_lat_codes) {
+        codes   = params->ref_codes;
+        codes_T = params->ref_T;
+    } else if (has_ref_audio) {
+        if (params->ref_n_samples < TOKENIZER_HOP_LENGTH) {
+            qt_set_error("tts_engine_admit: ref audio too short (%d samples)", params->ref_n_samples);
+            e->slots.pop_back();
+            return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
+        }
+        Timer t_enc;
+        int   aligned_T   = (params->ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
+        s.ref_codes_store = pipeline_codec_encode(&pt->codec, params->ref_audio_24k, aligned_T, params->dump_dir);
+        if (s.ref_codes_store.empty()) {
+            qt_set_error("tts_engine_admit: pipeline_codec_encode returned empty codes");
+            e->slots.pop_back();
+            return tts_admit_fail(job, QT_STATUS_GENERATE_FAILED);
+        }
+        codes   = s.ref_codes_store.data();
+        codes_T = (int) s.ref_codes_store.size() / pt->num_code_groups;
+        qt_log(QT_LOG_INFO, "[Pipeline] Breeze ref codes: %d frames (encode %.1f ms)", codes_T, t_enc.ms());
+    }
+
+    Timer t_build;
+    if (!prompt_builder_build_breeze(pt, params->text, instruct, ref_text, codes, codes_T, &s.prompt)) {
+        e->slots.pop_back();
+        return tts_admit_fail(job, QT_STATUS_GENERATE_FAILED);
+    }
+    s.perf.build_ms = t_build.ms();
+
+    if (params->dump_dir) {
+        DebugDumper d;
+        debug_init(&d, params->dump_dir);
+        std::vector<int32_t> ids32(s.prompt.prompt_ids.begin(), s.prompt.prompt_ids.end());
+        int                  n_ids = (int) ids32.size();
+        debug_dump_i32_as_f32(&d, "prompt-ids", ids32.data(), &n_ids, 1);
+        debug_dump_2d(&d, "talker-input-embed", s.prompt.input_embed.data(), s.prompt.T_ctx, s.prompt.hidden);
+        if (codes_T > 0) {
+            const int shape[2] = { pt->num_code_groups, codes_T };
+            debug_dump_i32_as_f32(&d, "ref-codes", codes, shape, 2);
+        }
+    }
+
+    s.prev_ids.assign((size_t) pt->num_code_groups, 0);
+    s.all_codes.reserve((size_t) params->max_new_tokens);
+    s.talker_history.reserve((size_t) params->max_new_tokens);
+
+    if (s.streaming) {
+        if (!tts_engine_codec_admit(e, &s)) {  // ref_codes_ptr is NULL: zero state
+            qt_set_error("tts_engine_admit: codec stream lane admit failed");
+            e->slots.pop_back();
+            return tts_admit_fail(job, QT_STATUS_GENERATE_FAILED);
+        }
+    }
+
+    TalkerForwardOutput fw;
+    Timer               t_prefill;
+    if (!talker_forward_prefill(&pt->talker, &pt->talker_kv, slot_idx, pt->sched, &pt->talker_arena, pt->hidden_bridge,
+                                s.prompt.input_embed.data(), s.prompt.T_ctx, pt->use_flash_attn, pt->clamp_fp16,
+                                params->dump_dir, &fw)) {
+        if (s.codec_set >= 0) {
+            e->codec_M--;
+        }
+        e->slots.pop_back();
+        return tts_admit_fail(job, QT_STATUS_GENERATE_FAILED);
+    }
+    s.perf.prefill_ms = t_prefill.ms();
+    s.logits          = std::move(fw.logits_last);
+    qt_log(QT_LOG_INFO, "[Batch] Admit slot=%d T_ctx=%d prefill=%.1f ms build=%.1f ms (Breeze)", slot_idx,
+           s.prompt.T_ctx, s.perf.prefill_ms, s.perf.build_ms);
+    return true;
+}
+
 // Retire one finished slot: streaming drain or buffered codec decode,
 // perf accounting, job status and worker side error capture. The codec
 // stream mirror releases here.
@@ -1154,7 +1299,12 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
         // Apply codec suppression: forbid [vocab - 1024, vocab) except
         // codec_eos. Then run the upstream sampling chain.
         Timer t_host;
-        apply_suppress(s.logits.data(), vocab, vocab - 1024, vocab, codec_eos_id);
+        if (pt->is_breeze) {
+            // Breeze: ids [2048, 2051) are reserved codebook slots, EOS is 2051.
+            apply_suppress(s.logits.data(), vocab, pt->breeze_c0_lo, pt->breeze_c0_hi, -1);
+        } else {
+            apply_suppress(s.logits.data(), vocab, vocab - 1024, vocab, codec_eos_id);
+        }
         float u_c0 = 0.0f;
         int   c0   = sample_top_k_p(s.logits.data(), vocab, p->temperature, p->top_k, p->top_p, p->repetition_penalty,
                                     s.talker_history.data(), (int) s.talker_history.size(), s.job->resolved_seed,

@@ -59,6 +59,11 @@ struct CodePredictorWeights {
     struct ggml_tensor * mtp_proj_w;
     struct ggml_tensor * mtp_proj_b;
 
+    // Breeze depth decoder: llama3 RoPE frequency factors [head_dim / 2]
+    // fed to ggml_rope_ext as its freq_factors argument (NULL on Qwen),
+    // and no per-head QK-norm (layer q_norm_w / k_norm_w stay NULL).
+    struct ggml_tensor * rope_freqs;
+
     // Layers reuse the same TalkerLayer struct since the per-layer
     // tensor set is identical. Only the model-level wiring differs.
     std::vector<TalkerLayer> layers;
@@ -110,6 +115,7 @@ static bool code_predictor_weights_load(CodePredictorWeights * cw, const GGUFMod
     // because upstream uses nn.Identity in that case.
     cw->mtp_proj_w = gf_try_load_tensor(&wctx, gf, "code_pred.mtp_proj.weight");
     cw->mtp_proj_b = gf_try_load_tensor(&wctx, gf, "code_pred.mtp_proj.bias");
+    cw->rope_freqs = gf_try_load_tensor(&wctx, gf, "code_pred.rope_freqs.weight");
 
     for (int g = 0; g < cw->num_acoustic_codebooks; g++) {
         char name[160];
@@ -138,10 +144,11 @@ static bool code_predictor_weights_load(CodePredictorWeights * cw, const GGUFMod
         snprintf(name, sizeof(name), "code_pred.blk.%d.attn_output.weight", l);
         layer.attn.o_proj_w = gf_load_tensor(&wctx, gf, name);
 
+        // Optional: the Breeze depth decoder is Llama style, no QK-norm.
         snprintf(name, sizeof(name), "code_pred.blk.%d.attn_q_norm.weight", l);
-        layer.attn.q_norm_w = gf_load_tensor(&wctx, gf, name);
+        layer.attn.q_norm_w = gf_try_load_tensor(&wctx, gf, name);
         snprintf(name, sizeof(name), "code_pred.blk.%d.attn_k_norm.weight", l);
-        layer.attn.k_norm_w = gf_load_tensor(&wctx, gf, name);
+        layer.attn.k_norm_w = gf_try_load_tensor(&wctx, gf, name);
 
         snprintf(name, sizeof(name), "code_pred.blk.%d.ffn_gate.weight", l);
         layer.mlp.gate_proj_w = gf_load_tensor(&wctx, gf, name);
@@ -160,10 +167,11 @@ static bool code_predictor_weights_load(CodePredictorWeights * cw, const GGUFMod
 
     qt_log(QT_LOG_INFO,
            "[CodePredictor] Loaded: %d layers, hidden %d, heads %d/%d, head_dim %d, "
-           "FFN %d, RoPE theta %.0f, %d acoustic codebooks (vocab %d each), mtp_proj %s",
+                              "FFN %d, RoPE theta %.0f, %d acoustic codebooks (vocab %d each), mtp_proj %s, qk_norm %s, rope_freqs %s",
            cw->num_hidden_layers, cw->hidden_size, cw->num_attention_heads, cw->num_key_value_heads, cw->head_dim,
            cw->intermediate_size, (double) cw->rope_theta, cw->num_acoustic_codebooks, cw->vocab_size,
-           cw->mtp_proj_w ? "linear" : "identity");
+           cw->mtp_proj_w ? (cw->mtp_proj_b ? "linear" : "linear-nobias") : "identity",
+           cw->layers.empty() || cw->layers[0].attn.q_norm_w ? "yes" : "no", cw->rope_freqs ? "llama3" : "none");
     return true;
 }
 

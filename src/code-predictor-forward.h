@@ -126,17 +126,24 @@ static struct ggml_tensor * code_predictor_layer_forward(struct ggml_context *  
     k = ggml_reshape_3d(ctx, k, hd, n_kv, TN);
     v = ggml_reshape_3d(ctx, v, hd, n_kv, TN);
 
-    q = ggml_rms_norm(ctx, q, eps);
-    q = ggml_mul(ctx, q, layer.attn.q_norm_w);
-    k = ggml_rms_norm(ctx, k, eps);
-    k = ggml_mul(ctx, k, layer.attn.k_norm_w);
+    // Per-head QK-norm (Qwen3 code predictor only; the Breeze depth
+    // decoder is Llama style and carries no q_norm / k_norm).
+    if (layer.attn.q_norm_w) {
+        q = ggml_rms_norm(ctx, q, eps);
+        q = ggml_mul(ctx, q, layer.attn.q_norm_w);
+    }
+    if (layer.attn.k_norm_w) {
+        k = ggml_rms_norm(ctx, k, eps);
+        k = ggml_mul(ctx, k, layer.attn.k_norm_w);
+    }
 
     // RoPE over the flattened token axis: positions [T * N] repeat the
-    // same in-frame offsets for every slot.
-    q = ggml_rope_ext(ctx, q, positions, NULL, hd, GGML_ROPE_TYPE_NEOX, 0, cw->rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
-                      0.0f);
-    k = ggml_rope_ext(ctx, k, positions, NULL, hd, GGML_ROPE_TYPE_NEOX, 0, cw->rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
-                      0.0f);
+    // same in-frame offsets for every slot. rope_freqs carries the llama3
+    // frequency factors on Breeze (theta / factor per pair), NULL on Qwen.
+    q = ggml_rope_ext(ctx, q, positions, cw->rope_freqs, hd, GGML_ROPE_TYPE_NEOX, 0, cw->rope_theta, 1.0f, 0.0f, 1.0f,
+                      0.0f, 0.0f);
+    k = ggml_rope_ext(ctx, k, positions, cw->rope_freqs, hd, GGML_ROPE_TYPE_NEOX, 0, cw->rope_theta, 1.0f, 0.0f, 1.0f,
+                      0.0f, 0.0f);
 
     // Write the fresh positions into each slot's set via set_rows:
     // [hd, heads, T*N] unflattens to [hd, heads, T, N], permutes to

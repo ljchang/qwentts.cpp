@@ -131,11 +131,14 @@ static bool talker_weights_load(TalkerWeights * tw, const GGUFModel & gf, ggml_b
     wctx_init(&wctx, n_tensors);
 
     tw->codec_embedding = gf_load_tensor(&wctx, gf, "talker.codec_embd.weight");
-    tw->text_embedding  = gf_load_tensor(&wctx, gf, "talker.text_embd.weight");
-    tw->text_proj_fc1_w = gf_load_tensor(&wctx, gf, "talker.text_proj.fc1.weight");
-    tw->text_proj_fc1_b = gf_load_tensor(&wctx, gf, "talker.text_proj.fc1.bias");
-    tw->text_proj_fc2_w = gf_load_tensor(&wctx, gf, "talker.text_proj.fc2.weight");
-    tw->text_proj_fc2_b = gf_load_tensor(&wctx, gf, "talker.text_proj.fc2.bias");
+    // Text embedding + ResizeMLP are Qwen only: Breeze feeds the backbone
+    // from its own T5Gemma2 text encoder (text-encoder.h), so the tensors
+    // are optional and stay NULL there.
+    tw->text_embedding  = gf_try_load_tensor(&wctx, gf, "talker.text_embd.weight");
+    tw->text_proj_fc1_w = gf_try_load_tensor(&wctx, gf, "talker.text_proj.fc1.weight");
+    tw->text_proj_fc1_b = gf_try_load_tensor(&wctx, gf, "talker.text_proj.fc1.bias");
+    tw->text_proj_fc2_w = gf_try_load_tensor(&wctx, gf, "talker.text_proj.fc2.weight");
+    tw->text_proj_fc2_b = gf_try_load_tensor(&wctx, gf, "talker.text_proj.fc2.bias");
     tw->codec_head_w    = gf_load_tensor(&wctx, gf, "talker.codec_head.weight");
     tw->norm_w          = gf_load_tensor(&wctx, gf, "talker.output_norm.weight");
 
