@@ -46,9 +46,20 @@ build/tts-server --model breeze-tts2-Q5_K_M.gguf --codec qwen-tokenizer-12hz-BF1
 
 ## Checking it
 
-The port was checked against the PyTorch reference: the tokenizer token for
-token (`gemma-tok`), greedy decoding frame by frame, and each quant's KL
-divergence against BF16.
+The port was checked against the PyTorch reference (bf16):
+
+- token ids are identical (`gemma-tok`);
+- the prefill logits match at cosine 0.99999, with the same argmax;
+- the depth decoder's teacher-forced KL against bf16 is 0.011 for Q5_K_M and
+  0.0042 for Q6_K.
+
+**Not yet ported:**
+
+- CFG (`cfg_scale` other than 1);
+- the dual-CFG `ref_edit` mode.
+
+**Known issue:** one long-passage render in five stopped a sentence early,
+so send text a sentence at a time.
 
 ## Credits and licences
 
